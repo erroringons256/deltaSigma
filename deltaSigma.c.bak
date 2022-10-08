@@ -1,0 +1,106 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+#include "circBuf.h"
+
+#define FLOAT_SIZE sizeof(float)
+#define CHANNELS 2
+#define BLOCK_SIZE 262144
+#define NOISE_FACTOR 2 / (double)(RAND_MAX)
+//#define GAIN 0.56676921
+#define GAIN 0.01
+#define CLIP_BUF 4096.0
+
+void deltaSigmaEncode(unsigned int, float*, char*, rBuffer*, rBuffer*, rBuffer*, rBuffer*);
+float randFloat();
+
+/*
+Psychoacoustically shaped 16x oversampling filter
+double const x1Filter[6] = {0.6746, -3.07505182, 5.650604334847973, -5.2260953627290405, 2.4302826697122626, -0.45401489672137707};
+double const y1Filter[6] = {5.8906, -14.50786442,19.122358320896, -14.226543299142167, 5.664459499781069, -0.9430107575337243};
+*/
+
+typedef struct filterStruct
+{
+    double numerator[3];
+    double denominator[3];
+} t_filter;
+
+double const xFilter[6][3] = {{1, -1, 0}, {1, -1, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}
+double const yFilter[6][2] = {11.9266, -65.2167974204, 216.2036317393587, -483.9660083703186, 770.6350063035526, -895.0636183478377, 764.0291972096082, -475.7044864089291, 210.69121295173684, -63.009173984749054, 11.424090176441757, -0.949653848463645};
+
+
+int main()
+{
+    srand(time(0));
+    float* inBuffer = malloc(BLOCK_SIZE * FLOAT_SIZE * CHANNELS); // Allocate input and output buffers for reading/writing on heap.
+    char* outBuffer = malloc(BLOCK_SIZE * CHANNELS);
+    rBuffer x1Buffer[CHANNELS]; // Allocate and initialise quantitisation error buffers for noise shaping filter. The filter even in a worst case scenario should not exceed ~100 samples, and as such, this can be allocated on the stack.
+    rBuffer x2Buffer[CHANNELS];
+    rBuffer y1Buffer[CHANNELS];
+    rBuffer y2Buffer[CHANNELS];
+    for(unsigned int i = 0; i < CHANNELS; i++)
+    {
+        initRBuffer(x1Buffer + i, 12, 0.0);
+        initRBuffer(y1Buffer + i, 12, 0.0);
+    }
+    FILE* fileHandle = fopen("/home/user/002.raw", "rb");
+    if(fileHandle == 0)
+    {
+        printf("Could not open input file!\n");
+        return(1);
+    }
+    FILE* fileHandle2 = fopen("/home/user/002_copy.raw", "wb");
+    if(fileHandle2 == 0)
+    {
+        printf("Could not open output file!\n");
+        return(1);
+    }
+    unsigned int samplesRead = 0; // Quantitise audio file chunk by chunk, with handling for the last chunk being of a different size.
+    do
+    {
+        samplesRead = fread(inBuffer, FLOAT_SIZE * CHANNELS, BLOCK_SIZE, fileHandle);
+        deltaSigmaEncode(samplesRead, inBuffer, outBuffer, x1Buffer, y1Buffer, x2Buffer, y2Buffer);
+        fwrite(outBuffer, samplesRead * CHANNELS, 1, fileHandle2);
+    } while (samplesRead == BLOCK_SIZE);
+    fclose(fileHandle);
+    fclose(fileHandle2);
+    return(0);
+}
+
+inline void deltaSigmaEncode(unsigned int blockSize, float* inBuffer, char* outBuffer, rBuffer* x1Buffer, rBuffer* y1Buffer, rBuffer* x2Buffer, rBuffer* y2Buffer) // This is where the noise shaping magic happens.
+{
+    char q = 0; // Temporary buffer variable to store quantitised state before further encoding into output file type.
+    double buf; //Temporary buffer variable to store temporary output of filter sum.
+    for(unsigned int offset = 0; offset < blockSize; offset++)
+    {
+        for(unsigned int channel = 0; channel < CHANNELS; channel++)
+        {
+            buf = 0.0;
+            inBuffer[CHANNELS * offset + channel] = GAIN * ((inBuffer[CHANNELS * offset + channel] <= -1.0) * (-1.0) + (inBuffer[CHANNELS * offset + channel] >= 1.0) * (1.0) + (inBuffer[CHANNELS * offset + channel] < 1.0 && inBuffer[CHANNELS * offset + channel] > -1.0) * inBuffer[CHANNELS * offset + channel]);
+            q = (char)(getRBufferElFromEnd(y1Buffer + channel, 0) + inBuffer[CHANNELS * offset + channel] + 0 * randFloat() >= 0.0f);
+            outBuffer[CHANNELS * offset + channel] = 254 * q + 1;
+
+            setRBufferElFromStart(x1Buffer + channel, 0, inBuffer[CHANNELS * offset + channel] - 2 * (double)q + 1);
+            rollRBuffer(x1Buffer + channel);
+
+            for(int i = 0; i < 12; i++)
+            {
+                buf += x1Filter[i] * getRBufferElFromEnd(x1Buffer + channel, i);
+            }
+            for(int i = 0; i < 12; i++)
+            {
+                buf += y1Filter[i] * getRBufferElFromEnd(y1Buffer + channel, i);
+            }
+            setRBufferElFromStart(y1Buffer + channel, 0, buf);
+            rollRBuffer(y1Buffer + channel);
+        }
+    }
+}
+
+inline float randFloat() // Simply a convenience function to return a random float value between -1 and 1.
+{
+    return NOISE_FACTOR * (double)(rand()) - 1;
+}
